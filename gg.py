@@ -59,13 +59,13 @@ def seconds_until_10am(days_offset=0):
 
 def make_pairs(queue):
     pairs = []
-    while len(queue) > 3:
-        pairs.append([queue.pop(0), queue.pop(0)])
-    if len(queue) == 3:
-        pairs.append(queue[:])
-        queue.clear()
-    elif len(queue) == 2:
-        pairs.append([queue.pop(0), queue.pop(0)])
+    while len(queue) >= 2:
+        # если осталось ровно 3 человека → делаем тройку и выходим
+        if len(queue) == 3:
+            pairs.append([queue.pop(0), queue.pop(0), queue.pop(0)])
+            break
+        else:
+            pairs.append([queue.pop(0), queue.pop(0)])
     return pairs
 
 def get_battle_mode():

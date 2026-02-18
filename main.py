@@ -4,12 +4,15 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram import F
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 TOKEN = "8427517284:AAFqANQ1Okf8OAnp63eVI7UJfP7iX7IC1Ts"
 ADMIN_ID = 5803112110
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
+
+scheduler = AsyncIOScheduler()
 
 # --- Хранилища ---
 round_queues = {}  # {round_num: {city: [список участников]}}
@@ -59,13 +62,9 @@ def seconds_until_10am(days_offset=0):
 
 def make_pairs(queue):
     pairs = []
-    while len(queue) > 3:
+    while len(queue) >= 2:
         pairs.append([queue.pop(0), queue.pop(0)])
-    if len(queue) == 3:
-        pairs.append(queue[:])
-        queue.clear()
-    elif len(queue) == 2:
-        pairs.append([queue.pop(0), queue.pop(0)])
+    # если остался один — он ждёт следующего соперника
     return pairs
 
 def get_battle_mode():
@@ -215,27 +214,39 @@ async def handle_receipt(message: types.Message):
     # сообщение пользователю
     await message.reply("✅ Чек отримано, очікуй підтвердження!")
 
-# --- Обработка кнопок ---
+# --- Обработка подтверждения ---
 @dp.callback_query(lambda c: c.data.startswith("approve:"))
 async def approve_handler(callback: types.CallbackQuery):
     user_id = int(callback.data.split(":")[1])
     city = user_city.get(user_id, "не вказано")
 
+    # убираем кнопки у админа
     await callback.message.edit_reply_markup(reply_markup=None)
     await bot.send_message(user_id, "✅ Ваша анкета підтверджена і скоро буде опублікована!")
     await callback.answer("Заявка підтверджена!")
 
+    # переносим заявку в очередь
     if user_id in pending_albums:
         moto_media, media_type = pending_albums[user_id]["media"]
         username = pending_albums[user_id]["username"]
 
-        round_queues.setdefault(1, {}).setdefault(city, []).append((user_id, moto_media, city, username, media_type))
+        round_queues.setdefault(1, {}).setdefault(city, []).append(
+            (user_id, moto_media, city, username, media_type)
+        )
         user_photos_final[user_id] = (moto_media, city, username, media_type)
         del pending_albums[user_id]
 
+    # если в городе >=2 участников → публикуем пары
     if len(round_queues[1][city]) >= 2:
-        asyncio.create_task(schedule_stage(1, days_offset=0))
+        asyncio.create_task(publish_stage(1, city))
 
+        # проверку голосов планируем через сутки
+        scheduler.add_job(
+            check_votes_and_prepare_next_round,
+            "date",
+            run_date=datetime.datetime.now() + datetime.timedelta(hours=24),
+            args=[1]
+        )
 
 @dp.callback_query(lambda c: c.data.startswith("reject:"))
 async def reject_handler(callback: types.CallbackQuery):
@@ -290,50 +301,34 @@ async def schedule_stage(round_num: int, days_offset: int):
     await check_votes_and_prepare_next_round(round_num)
 
 
-async def publish_stage(round_num: int):
-    city_groups = round_queues.get(round_num, {})
+# --- Публикация тура ---
+async def publish_stage(round_num: int, city: str):
+    participants = round_queues.get(round_num, {}).get(city, [])
+    pairs = make_pairs(participants)  # используем очередь напрямую, а не копию
 
-    for city, participants in city_groups.items():
-        pairs = make_pairs(participants[:])
+    for pair in pairs:
+        uids = [uid for uid, _, _, _, _ in pair]
 
-        for pair in pairs:
-            uids = [uid for uid, _, _, _, _ in pair]
-            media_types = [media_type for (_, _, _, _, media_type) in pair]
-
-            if all(mt == "photo" for mt in media_types):
-                media = [
-                    types.InputMediaPhoto(media=moto, caption=f"🏍️ Учасник {i+1}")
-                    for i, (uid, moto, _, _, _) in enumerate(pair)
-                ]
-                await bot.send_media_group(chat_id=CITY_CHANNELS[city], media=media)
-
-            elif all(mt == "video" for mt in media_types):
-                media = [
-                    types.InputMediaVideo(media=moto, caption=f"🎥 Учасник {i+1}")
-                    for i, (uid, moto, _, _, _) in enumerate(pair)
-                ]
-                await bot.send_media_group(chat_id=CITY_CHANNELS[city], media=media)
-
+        # формируем медиа
+        media = []
+        for i, (uid, moto, _, _, media_type) in enumerate(pair):
+            if media_type == "photo":
+                media.append(types.InputMediaPhoto(media=moto, caption=f"🏍️ Учасник {i+1}"))
             else:
-                for i, (uid, moto, _, _, media_type) in enumerate(pair):
-                    if media_type == "photo":
-                        await bot.send_photo(chat_id=CITY_CHANNELS[city], photo=moto, caption=f"🏍️ Учасник {i+1}")
-                    else:
-                        await bot.send_video(chat_id=CITY_CHANNELS[city], video=moto, caption=f"🎥 Учасник {i+1}")
+                media.append(types.InputMediaVideo(media=moto, caption=f"🎥 Учасник {i+1}"))
 
-            kb = get_vote_keyboard(round_num, *uids)
-            msg = await bot.send_message(
-                chat_id=CITY_CHANNELS[city],
-                text=get_vote_text(round_num),
-                reply_markup=kb
-            )
+        await bot.send_media_group(chat_id=CITY_CHANNELS[city], media=media)
 
-            votes.setdefault(round_num, {})[msg.message_id] = {
-                "participants": uids,
-                "votes": {}
-            }
+        kb = get_vote_keyboard(round_num, *uids)
+        msg = await bot.send_message(chat_id=CITY_CHANNELS[city], text=get_vote_text(round_num), reply_markup=kb)
 
+        votes.setdefault(round_num, {})[msg.message_id] = {
+            "participants": uids,
+            "votes": {},
+            "chat_id": CITY_CHANNELS[city]
+        }
 
+# --- Проверка голосов ---
 async def check_votes_and_prepare_next_round(round_num: int):
     next_round = round_num + 1
     round_queues.setdefault(next_round, {})
@@ -351,23 +346,31 @@ async def check_votes_and_prepare_next_round(round_num: int):
 
         round_queues[next_round].setdefault(city, []).append((winner, moto_media, city, username, media_type))
 
-        if len(round_queues[next_round][city]) == 1 and next_round > round_num:
-            await bot.send_message(
-                chat_id=CITY_CHANNELS.get(city, ADMIN_ID),
-                text=f"🏆 Переможець батлу ({city}): @{username}" if username else f"🏆 Переможець батлу ({city}): ID {winner}"
-            )
+        await bot.send_message(
+            chat_id=CITY_CHANNELS.get(city, ADMIN_ID),
+            text=f"🏆 Переможець батлу ({city}): @{username}" if username else f"🏆 Переможець батлу ({city}): ID {winner}"
+        )
 
         del votes[round_num][msg_id]
 
     if round_num in votes and not votes[round_num]:
         del votes[round_num]
 
+    # если есть участники → запускаем следующий тур
     if round_queues[next_round]:
-        asyncio.create_task(schedule_stage(next_round, days_offset=1))
-
+        for city in round_queues[next_round]:
+            if len(round_queues[next_round][city]) >= 2:
+                asyncio.create_task(publish_stage(next_round, city))
+                scheduler.add_job(
+                    check_votes_and_prepare_next_round,
+                    "date",
+                    run_date=datetime.datetime.now() + datetime.timedelta(hours=24),
+                    args=[next_round]
+                )
 
 # --- Основной запуск ---
 async def main():
+    scheduler.start()   # запускаем планировщик
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
